@@ -1,0 +1,11 @@
+# Python 3.9+（專案使用 list[str] 等型別標註）
+# 依 src/、scripts/ 直接 import 整理
+
+# 深度學習與影像
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+Pillow>=9.0.0
+
+# 經典 CNN：GFLOPs 估算
+thop>=0.1.1
