@@ -1,4 +1,4 @@
-"""依序訓練並評估多種 CNN（dataset 模式：dataset/nmos + dataset/dienumbers）。"""
+"""依序訓練並評估多種 CNN（dataset 模式：train 用 dataset/nmos+dienumbers；test 用 dataset/test/*）。"""
 
 from __future__ import annotations
 

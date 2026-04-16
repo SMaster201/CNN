@@ -440,34 +440,35 @@ def get_dataset_eval_paths_and_loader(
     seed: int = 42,
 ) -> tuple[list[str], DataLoader]:
     """
-    依 train 時相同切分取 val，再從其中各取前 100 張：
+    從 dataset/test/nmos 與 dataset/test/dienumbers 讀取完整測試集：
     - nmos: 檔名前 6 碼
     - dienumbers: 檔名前 2 碼（1 英文 + 1 數字）
     """
-    paths, labels, _ = collect_dataset_samples(dataset_root)
-    _, val_idx = _train_val_indices(labels, val_ratio, seed)
-    va_paths = [paths[i] for i in val_idx]
-    va_labels = [labels[i] for i in val_idx]
+    del val_ratio, seed
+    test_root = dataset_root / "test"
+    nmos_root = test_root / "nmos"
+    die_root = test_root / "dienumbers"
+    if not nmos_root.is_dir() or not die_root.is_dir():
+        raise FileNotFoundError(f"需要 {dataset_root}/test/nmos 與 {dataset_root}/test/dienumbers")
 
-    nmos_paths: list[Path] = []
-    nmos_labels: list[int] = []
-    die_paths: list[Path] = []
-    die_labels: list[int] = []
-    for p, y in zip(va_paths, va_labels):
+    _, _, class_names = collect_dataset_samples(dataset_root)
+    str_to_idx = {c: i for i, c in enumerate(class_names)}
+
+    nmos_paths, _, _ = collect_nmos_samples(nmos_root)
+    die_paths, _, _ = collect_dienumbers_samples(die_root)
+
+    te_paths = sorted(nmos_paths + die_paths)
+    te_labels: list[int] = []
+    for p in te_paths:
         m6 = _NMOS_STEM_RE.match(p.stem)
-        m2 = _DIENUM_STEM_RE.match(p.stem)
         if m6:
-            nmos_paths.append(p)
-            nmos_labels.append(y)
-        elif m2:
-            die_paths.append(p)
-            die_labels.append(y)
-    nmos_paths = nmos_paths[:100]
-    nmos_labels = nmos_labels[:100]
-    die_paths = die_paths[:100]
-    die_labels = die_labels[:100]
-    te_paths = nmos_paths + die_paths
-    te_labels = nmos_labels + die_labels
+            te_labels.append(str_to_idx[m6.group(1)])
+            continue
+        m2 = _DIENUM_STEM_RE.match(p.stem)
+        if m2:
+            te_labels.append(str_to_idx[m2.group(1).upper()])
+            continue
+        raise ValueError(f"測試檔名不符合規則: {p.name}")
 
     ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False))
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())

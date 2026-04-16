@@ -161,6 +161,28 @@ def _char_level_metrics(rows: list[dict]) -> dict:
     }
 
 
+def _dataset_split_summary(rows: list[dict]) -> dict:
+    nmos_total = 0
+    nmos_correct = 0
+    dienumbers_total = 0
+    dienumbers_correct = 0
+    for r in rows:
+        image_id = str(r["image_id"]).replace("\\", "/").lower()
+        ok = int(r["correct"])
+        if "/test/nmos/" in image_id or "/nmos/" in image_id:
+            nmos_total += 1
+            nmos_correct += ok
+        elif "/test/dienumbers/" in image_id or "/dienumbers/" in image_id:
+            dienumbers_total += 1
+            dienumbers_correct += ok
+    return {
+        "nmos_test_total": int(nmos_total),
+        "nmos_test_correct": int(nmos_correct),
+        "dienumbers_test_total": int(dienumbers_total),
+        "dienumbers_test_correct": int(dienumbers_correct),
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--weights", type=str, default="", help="train_classifier 產生的 best.pt")
@@ -183,8 +205,8 @@ def main() -> None:
     p.add_argument(
         "--max-test-samples",
         type=int,
-        default=100,
-        help="評估時最多使用的測試張數（預設 100；<=0 表示使用全部測試集）",
+        default=0,
+        help="評估時最多使用的測試張數（預設 0；<=0 表示使用全部測試集）",
     )
     p.add_argument(
         "--per-image-csv",
@@ -247,7 +269,7 @@ def main() -> None:
         image_ids, loader = get_dataset_eval_paths_and_loader(
             root, arch, args.batch_size, args.workers, vr, sd
         )
-        # dataset 模式已在 loader 內控制成 nmos 100 + dienumbers 100；不再全域二次截斷。
+        # dataset 模式直接讀 dataset/test 下完整測試集；不再全域二次截斷。
         args.max_test_samples = 0
         raw_names = ckpt.get("class_names")
         if isinstance(raw_names, list) and len(raw_names) == num_classes:
@@ -345,6 +367,7 @@ def main() -> None:
         "weights": str(wpath.resolve()),
     }
     payload.update(_char_level_metrics(per_rows))
+    payload.update(_dataset_split_summary(per_rows))
     if not args.no_per_image_csv and per_rows:
         csv_path = Path(args.per_image_csv) if args.per_image_csv else out_dir / f"{arch}_per_image_predictions.csv"
         if not csv_path.is_absolute():
