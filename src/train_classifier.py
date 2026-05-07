@@ -40,6 +40,7 @@ def main() -> None:
     p.add_argument("--val-ratio", type=float, default=0.1)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--device", type=str, default="")
+    p.add_argument("--preprocess", type=str, default="p10", choices=("none", "p10"), help="訓練/驗證前處理流程")
     args = p.parse_args()
 
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,6 +67,7 @@ def main() -> None:
             args.nmos_val_ratio,
             args.nmos_test_ratio,
             args.workers,
+            preprocess=args.preprocess,
             seed=args.split_seed,
         )
         nmos_meta = {
@@ -73,6 +75,7 @@ def main() -> None:
             "nmos_val_ratio": float(args.nmos_val_ratio),
             "nmos_test_ratio": float(args.nmos_test_ratio),
             "split_seed": int(args.split_seed),
+            "preprocess": args.preprocess,
             "class_names": class_names,
         }
     elif ds == "dataset":
@@ -85,6 +88,7 @@ def main() -> None:
             args.batch_size,
             args.nmos_val_ratio,
             args.workers,
+            preprocess=args.preprocess,
             seed=args.split_seed,
         )
         test_loader = val_loader
@@ -92,6 +96,7 @@ def main() -> None:
             "dataset_root": str(dataset_root.resolve()),
             "nmos_val_ratio": float(args.nmos_val_ratio),
             "split_seed": int(args.split_seed),
+            "preprocess": args.preprocess,
             "class_names": class_names,
         }
     else:

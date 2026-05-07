@@ -202,6 +202,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--device", type=str, default="")
+    p.add_argument("--preprocess", type=str, default="", help="留空則沿用權重內設定；可指定 none|p10")
     p.add_argument(
         "--max-test-samples",
         type=int,
@@ -238,6 +239,10 @@ def main() -> None:
     model.eval()
 
     ds = args.dataset.lower()
+    ckpt_preprocess = str(ckpt.get("preprocess", "none")).lower()
+    preprocess = (args.preprocess or ckpt_preprocess).lower()
+    if preprocess not in {"none", "p10"}:
+        raise ValueError("preprocess 只支援 none 或 p10")
     if ds == "cifar10":
         image_ids, loader = get_cifar10_test_ids_and_loader(
             Path(args.data_root), arch, args.batch_size, args.workers
@@ -252,7 +257,7 @@ def main() -> None:
         tr = float(ckpt.get("nmos_test_ratio", args.nmos_test_ratio))
         sd = int(ckpt.get("split_seed", args.split_seed))
         image_ids, loader = get_nmos_test_paths_and_loader(
-            nmos_root, arch, args.batch_size, args.workers, vr, tr, sd
+            nmos_root, arch, args.batch_size, args.workers, vr, tr, preprocess, sd
         )
         raw_names = ckpt.get("class_names")
         if isinstance(raw_names, list) and len(raw_names) == num_classes:
@@ -267,7 +272,7 @@ def main() -> None:
         vr = float(ckpt.get("nmos_val_ratio", args.nmos_val_ratio))
         sd = int(ckpt.get("split_seed", args.split_seed))
         image_ids, loader = get_dataset_eval_paths_and_loader(
-            root, arch, args.batch_size, args.workers, vr, sd
+            root, arch, args.batch_size, args.workers, vr, preprocess, sd
         )
         # dataset 模式直接讀 dataset/test 下完整測試集；不再全域二次截斷。
         args.max_test_samples = 0
@@ -355,6 +360,7 @@ def main() -> None:
     metrics_name = f"{arch}_metrics.json"
     payload = {
         "arch": arch,
+        "preprocess": preprocess,
         "accuracy": acc,
         "precision_macro": float(prec),
         "recall_macro": float(rec),

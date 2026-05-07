@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -143,6 +144,24 @@ _NMOS_STEM_RE = re.compile(r"^(\d{6})")
 _DIENUM_STEM_RE = re.compile(r"^([A-Za-z]\d)")
 
 
+def _apply_p10_preprocess(img: Image.Image) -> Image.Image:
+    """
+    套用 visualize_p10_steps.py 的 P10 強化流程（不含視覺化輸出）。
+    """
+    arr = np.array(img.convert("L"))
+    h, w = arr.shape[:2]
+    r_end = int(h * 0.4)
+    c_end = int(w * 0.6)
+    block = arr[:r_end, :c_end]
+    resized = cv2.resize(block, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
+    _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    v_kernel = np.ones((7, 1), np.uint8)
+    dilated = cv2.dilate(thresh, v_kernel, iterations=1)
+    inverted = cv2.bitwise_not(dilated)
+    final = cv2.copyMakeBorder(inverted, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=255)
+    return Image.fromarray(final).convert("RGB")
+
+
 def collect_nmos_samples(nmos_root: Path) -> tuple[list[Path], list[int], list[str]]:
     """
     掃描扁平資料夾 nmos_root；檔名（不含副檔名）開頭須為連續 6 位數字，以此為 GT 類別碼。
@@ -239,16 +258,21 @@ def collect_dataset_samples(dataset_root: Path) -> tuple[list[Path], list[int], 
 
 
 class NmosDataset(Dataset):
-    def __init__(self, paths: list[Path], labels: list[int], transform) -> None:
+    def __init__(self, paths: list[Path], labels: list[int], transform, preprocess: str = "none") -> None:
         self.paths = paths
         self.labels = labels
         self.transform = transform
+        self.preprocess = preprocess.lower()
+        if self.preprocess not in {"none", "p10"}:
+            raise ValueError(f"不支援 preprocess={preprocess}，可用值：none, p10")
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, i: int):
         img = Image.open(self.paths[i]).convert("RGB")
+        if self.preprocess == "p10":
+            img = _apply_p10_preprocess(img)
         x = self.transform(img)
         return x, self.labels[i]
 
@@ -351,6 +375,7 @@ def get_nmos_loaders(
     val_ratio: float,
     test_ratio: float,
     num_workers: int,
+    preprocess: str = "none",
     seed: int = 42,
 ) -> tuple[DataLoader, DataLoader, DataLoader, int, list[str]]:
     paths, labels, class_names = collect_nmos_samples(nmos_root)
@@ -363,9 +388,9 @@ def get_nmos_loaders(
     te_labels = [labels[i] for i in test_idx]
     num_classes = len(class_names)
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    train_ds = NmosDataset(tr_paths, tr_labels, transforms_nmos(arch, True))
-    val_ds = NmosDataset(va_paths, va_labels, transforms_nmos(arch, False))
-    test_ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False))
+    train_ds = NmosDataset(tr_paths, tr_labels, transforms_nmos(arch, True), preprocess=preprocess)
+    val_ds = NmosDataset(va_paths, va_labels, transforms_nmos(arch, False), preprocess=preprocess)
+    test_ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False), preprocess=preprocess)
     return (
         DataLoader(train_ds, shuffle=True, **kw),
         DataLoader(val_ds, shuffle=False, **kw),
@@ -382,6 +407,7 @@ def get_nmos_test_paths_and_loader(
     num_workers: int,
     val_ratio: float,
     test_ratio: float,
+    preprocess: str = "none",
     seed: int = 42,
 ) -> tuple[list[str], DataLoader]:
     """與 get_nmos_loaders 相同測試切分；回傳絕對路徑字串列表（與 batch 順序一致）。"""
@@ -389,7 +415,7 @@ def get_nmos_test_paths_and_loader(
     _, _, test_idx = _nmos_train_val_test_indices(labels, val_ratio, test_ratio, seed)
     te_paths = [paths[i] for i in test_idx]
     te_labels = [labels[i] for i in test_idx]
-    test_ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False))
+    test_ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False), preprocess=preprocess)
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
     loader = DataLoader(test_ds, shuffle=False, **kw)
     return [str(p.resolve()) for p in te_paths], loader
@@ -402,11 +428,12 @@ def get_nmos_test_loader(
     num_workers: int,
     val_ratio: float,
     test_ratio: float,
+    preprocess: str = "none",
     seed: int = 42,
 ) -> DataLoader:
     """與 get_nmos_loaders 相同切分，僅回傳測試集 DataLoader。"""
     _, loader = get_nmos_test_paths_and_loader(
-        nmos_root, arch, batch_size, num_workers, val_ratio, test_ratio, seed
+        nmos_root, arch, batch_size, num_workers, val_ratio, test_ratio, preprocess, seed
     )
     return loader
 
@@ -417,6 +444,7 @@ def get_dataset_loaders(
     batch_size: int,
     val_ratio: float,
     num_workers: int,
+    preprocess: str = "none",
     seed: int = 42,
 ) -> tuple[DataLoader, DataLoader, int, list[str]]:
     paths, labels, class_names = collect_dataset_samples(dataset_root)
@@ -426,8 +454,8 @@ def get_dataset_loaders(
     va_paths = [paths[i] for i in val_idx]
     va_labels = [labels[i] for i in val_idx]
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    train_ds = NmosDataset(tr_paths, tr_labels, transforms_nmos(arch, True))
-    val_ds = NmosDataset(va_paths, va_labels, transforms_nmos(arch, False))
+    train_ds = NmosDataset(tr_paths, tr_labels, transforms_nmos(arch, True), preprocess=preprocess)
+    val_ds = NmosDataset(va_paths, va_labels, transforms_nmos(arch, False), preprocess=preprocess)
     return DataLoader(train_ds, shuffle=True, **kw), DataLoader(val_ds, shuffle=False, **kw), len(class_names), class_names
 
 
@@ -437,6 +465,7 @@ def get_dataset_eval_paths_and_loader(
     batch_size: int,
     num_workers: int,
     val_ratio: float,
+    preprocess: str = "none",
     seed: int = 42,
 ) -> tuple[list[str], DataLoader]:
     """
@@ -470,7 +499,7 @@ def get_dataset_eval_paths_and_loader(
             continue
         raise ValueError(f"測試檔名不符合規則: {p.name}")
 
-    ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False))
+    ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False), preprocess=preprocess)
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
     loader = DataLoader(ds, shuffle=False, **kw)
     return [str(p.resolve()) for p in te_paths], loader
