@@ -200,6 +200,13 @@ def _apply_p10_preprocess(img: Image.Image) -> Image.Image:
     p3 = _p10_from_block(b3)
 
     # 三個區塊轉成 RGB（其它位置不提供，等價於固定/不使用）
+    # 注意：由於切割邊界用 int(h*ratio) 會有「±1 像素」誤差，
+    # 所以 P10 後尺寸可能不完全一致；疊合前先 resize 成同尺寸。
+    th, tw = p1.shape[:2]
+    if p2.shape[:2] != (th, tw):
+        p2 = cv2.resize(p2, (tw, th), interpolation=cv2.INTER_CUBIC)
+    if p3.shape[:2] != (th, tw):
+        p3 = cv2.resize(p3, (tw, th), interpolation=cv2.INTER_CUBIC)
     out = np.stack([p1, p2, p3], axis=-1)  # HWC, uint8
     return Image.fromarray(out)
 
