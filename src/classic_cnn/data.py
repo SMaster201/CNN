@@ -146,20 +146,62 @@ _DIENUM_STEM_RE = re.compile(r"^([A-Za-z]\d)")
 
 def _apply_p10_preprocess(img: Image.Image) -> Image.Image:
     """
-    套用 visualize_p10_steps.py 的 P10 強化流程（不含視覺化輸出）。
+    套用 visualize_p10_steps.py 的 P10 強化流程（不含視覺化輸出），並且從原圖抽取指定區塊後餵給分類器。
+
+    區塊定義（對應 visualize_p10_steps.py 的切割規則）：
+    - 取 `r1_c1`、`r2_c1`、`r3_c2`
+    - 其餘位置視為固定資訊（不納入輸入）
+    - 三個區塊各自跑完 P10，最後以 RGB channel 疊合：
+      - R = P10(r1_c1)
+      - G = P10(r2_c1)
+      - B = P10(r3_c2)
     """
     arr = np.array(img.convert("L"))
     h, w = arr.shape[:2]
-    r_end = int(h * 0.4)
-    c_end = int(w * 0.6)
-    block = arr[:r_end, :c_end]
-    resized = cv2.resize(block, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
-    _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    v_kernel = np.ones((7, 1), np.uint8)
-    dilated = cv2.dilate(thresh, v_kernel, iterations=1)
-    inverted = cv2.bitwise_not(dilated)
-    final = cv2.copyMakeBorder(inverted, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=255)
-    return Image.fromarray(final).convert("RGB")
+
+    # 與 visualize_p10_steps.py 一致：3 rows x 2 cols（row/col 以百分比切割）
+    row_bounds = [(0, int(h * 0.4)), (int(h * 0.3), int(h * 0.7)), (int(h * 0.6), h)]
+    col_bounds = [(0, int(w * 0.6)), (int(w * 0.4), w)]
+
+    def _p10_from_block(block: np.ndarray) -> np.ndarray:
+        """對單一灰階區塊跑完 P10，回傳最終 uint8 灰階影像。"""
+        resized = cv2.resize(block, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
+        _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        v_kernel = np.ones((7, 1), np.uint8)
+        dilated = cv2.dilate(thresh, v_kernel, iterations=1)
+        inverted = cv2.bitwise_not(dilated)
+        final = cv2.copyMakeBorder(
+            inverted,
+            50,
+            50,
+            50,
+            50,
+            cv2.BORDER_CONSTANT,
+            value=255,
+        )
+        return final
+
+    # r1_c1
+    r1_start, r1_end = row_bounds[0]
+    c1_start, c1_end = col_bounds[0]
+    b1 = arr[r1_start:r1_end, c1_start:c1_end]
+
+    # r2_c1
+    r2_start, r2_end = row_bounds[1]
+    b2 = arr[r2_start:r2_end, c1_start:c1_end]
+
+    # r3_c2
+    r3_start, r3_end = row_bounds[2]
+    c2_start, c2_end = col_bounds[1]
+    b3 = arr[r3_start:r3_end, c2_start:c2_end]
+
+    p1 = _p10_from_block(b1)
+    p2 = _p10_from_block(b2)
+    p3 = _p10_from_block(b3)
+
+    # 三個區塊轉成 RGB（其它位置不提供，等價於固定/不使用）
+    out = np.stack([p1, p2, p3], axis=-1)  # HWC, uint8
+    return Image.fromarray(out)
 
 
 def collect_nmos_samples(nmos_root: Path) -> tuple[list[Path], list[int], list[str]]:
