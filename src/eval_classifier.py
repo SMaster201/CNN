@@ -183,111 +183,26 @@ def _dataset_split_summary(rows: list[dict]) -> dict:
     }
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--weights", type=str, default="", help="train_classifier 產生的 best.pt")
-    p.add_argument(
-        "--arch",
-        type=str,
-        default="",
-        help="若未指定 --weights，則使用 runs_classic/<arch>/best.pt（見 models.ARCH_CHOICES）",
-    )
-    p.add_argument("--dataset", type=str, default="nmos", help="cifar10 | nmos | dataset | ImageFolder 根目錄")
-    p.add_argument("--data-root", type=str, default="data")
-    p.add_argument("--dataset-root", type=str, default="dataset", help="dataset 根目錄（內含 nmos/ 與 dienumbers/）")
-    p.add_argument("--nmos-dir", type=str, default="nmos", help="nmos 資料夾（評估時若權重內有 nmos_dir 則優先使用）")
-    p.add_argument("--nmos-val-ratio", type=float, default=0.3)
-    p.add_argument("--nmos-test-ratio", type=float, default=0.0)
-    p.add_argument("--split-seed", type=int, default=42)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--workers", type=int, default=4)
-    p.add_argument("--device", type=str, default="")
-    p.add_argument("--preprocess", type=str, default="", help="留空則沿用權重內設定；可指定 none|p10")
-    p.add_argument(
-        "--max-test-samples",
-        type=int,
-        default=0,
-        help="評估時最多使用的測試張數（預設 0；<=0 表示使用全部測試集）",
-    )
-    p.add_argument(
-        "--per-image-csv",
-        type=str,
-        default="",
-        help="逐張 GT/預測輸出 CSV；留空則 results_classic/<arch>/<arch>_per_image_predictions.csv",
-    )
-    p.add_argument("--no-per-image-csv", action="store_true", help="不寫逐張預測 CSV")
-    args = p.parse_args()
-
-    device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_str)
-
-    if args.weights:
-        wpath = Path(args.weights)
-    elif args.arch:
-        wpath = _ROOT / "runs_classic" / args.arch / "best.pt"
-    else:
-        raise SystemExit("請提供 --weights，或同時用 --arch（例如 lenet）以自動找 runs_classic/<arch>/best.pt")
-
-    if not wpath.is_file():
-        raise FileNotFoundError(f"找不到權重: {wpath}")
-
-    ckpt = torch.load(wpath, map_location=device)
-    arch = ckpt["arch"]
-    num_classes = int(ckpt["num_classes"])
-    model = build_model(arch, num_classes).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-
-    ds = args.dataset.lower()
-    ckpt_preprocess = str(ckpt.get("preprocess", "none")).lower()
-    preprocess = (args.preprocess or ckpt_preprocess).lower()
-    if preprocess not in {"none", "p10"}:
-        raise ValueError("preprocess 只支援 none 或 p10")
-    if ds == "cifar10":
-        image_ids, loader = get_cifar10_test_ids_and_loader(
-            Path(args.data_root), arch, args.batch_size, args.workers
-        )
-        class_names: list[str] = list(CIFAR10_CLASS_NAMES)
-    elif ds == "nmos":
-        nmos_dir = ckpt.get("nmos_dir") or args.nmos_dir
-        nmos_root = Path(nmos_dir)
-        if not nmos_root.is_absolute():
-            nmos_root = _ROOT / nmos_root
-        vr = float(ckpt.get("nmos_val_ratio", args.nmos_val_ratio))
-        tr = float(ckpt.get("nmos_test_ratio", args.nmos_test_ratio))
-        sd = int(ckpt.get("split_seed", args.split_seed))
-        image_ids, loader = get_nmos_test_paths_and_loader(
-            nmos_root, arch, args.batch_size, args.workers, vr, tr, preprocess, sd
-        )
-        raw_names = ckpt.get("class_names")
-        if isinstance(raw_names, list) and len(raw_names) == num_classes:
-            class_names = [str(x) for x in raw_names]
-        else:
-            class_names = [str(i) for i in range(num_classes)]
-    elif ds == "dataset":
-        dataset_root = ckpt.get("dataset_root") or args.dataset_root
-        root = Path(dataset_root)
-        if not root.is_absolute():
-            root = _ROOT / root
-        vr = float(ckpt.get("nmos_val_ratio", args.nmos_val_ratio))
-        sd = int(ckpt.get("split_seed", args.split_seed))
-        image_ids, loader = get_dataset_eval_paths_and_loader(
-            root, arch, args.batch_size, args.workers, vr, preprocess, sd
-        )
-        # dataset 模式直接讀 dataset/test 下完整測試集；不再全域二次截斷。
-        args.max_test_samples = 0
-        raw_names = ckpt.get("class_names")
-        if isinstance(raw_names, list) and len(raw_names) == num_classes:
-            class_names = [str(x) for x in raw_names]
-        else:
-            class_names = [str(i) for i in range(num_classes)]
-    else:
-        image_ids, loader, if_classes = get_imagefolder_test_paths_and_loader(
-            Path(args.dataset), arch, args.batch_size, args.workers
-        )
-        class_names = [str(c) for c in if_classes]
-
-    image_ids, loader = _cap_test_samples(image_ids, loader, args.max_test_samples)
+def _evaluate_loader_and_write(
+    *,
+    model: torch.nn.Module,
+    device: torch.device,
+    arch: str,
+    num_classes: int,
+    class_names: list[str],
+    image_ids: list[str],
+    loader: DataLoader,
+    preprocess: str,
+    wpath: Path,
+    metrics_basename_suffix: str,
+    per_image_csv_arg: str,
+    no_per_image_csv: bool,
+    max_test_samples: int,
+    dataset_test_split: str | None = None,
+) -> dict:
+    """跑單一 DataLoader 的推論並寫入 metrics（與可選 CSV）。"""
+    out_dir = _ROOT / "results_classic" / arch
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     cuda_i = _cuda_idx() if device.type == "cuda" else None
     _reset_cuda_peak_safe(cuda_i)
@@ -355,10 +270,8 @@ def main() -> None:
     vram_mb = _peak_mb_safe(cuda_i)
     gfl = _gflops(model, arch)
 
-    out_dir = _ROOT / "results_classic" / arch
-    out_dir.mkdir(parents=True, exist_ok=True)
-    metrics_name = f"{arch}_metrics.json"
-    payload = {
+    metrics_name = f"{arch}_metrics{metrics_basename_suffix}.json"
+    payload: dict = {
         "arch": arch,
         "preprocess": preprocess,
         "accuracy": acc,
@@ -369,15 +282,22 @@ def main() -> None:
         "gflops": gfl,
         "vram_peak_mb": vram_mb,
         "num_test_samples": n_img,
-        "max_test_samples": args.max_test_samples,
+        "max_test_samples": max_test_samples,
         "weights": str(wpath.resolve()),
     }
+    if dataset_test_split is not None:
+        payload["dataset_test_split"] = dataset_test_split
     payload.update(_char_level_metrics(per_rows))
     payload.update(_dataset_split_summary(per_rows))
-    if not args.no_per_image_csv and per_rows:
-        csv_path = Path(args.per_image_csv) if args.per_image_csv else out_dir / f"{arch}_per_image_predictions.csv"
-        if not csv_path.is_absolute():
-            csv_path = _ROOT / csv_path
+
+    if not no_per_image_csv and per_rows:
+        if per_image_csv_arg:
+            pcsv = Path(per_image_csv_arg)
+            if not pcsv.is_absolute():
+                pcsv = _ROOT / pcsv
+            csv_path = pcsv.with_name(f"{pcsv.stem}{metrics_basename_suffix}{pcsv.suffix}")
+        else:
+            csv_path = out_dir / f"{arch}_per_image_predictions{metrics_basename_suffix}.csv"
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         fields = [
             "image_id",
@@ -401,12 +321,168 @@ def main() -> None:
 
     metrics_path = out_dir / metrics_name
     payload["metrics_json"] = str(metrics_path.resolve())
+    metrics_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return payload
 
-    metrics_path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--weights", type=str, default="", help="train_classifier 產生的 best.pt")
+    p.add_argument(
+        "--arch",
+        type=str,
+        default="",
+        help="若未指定 --weights，則使用 runs_classic/<arch>/best.pt（見 models.ARCH_CHOICES）",
     )
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    p.add_argument("--dataset", type=str, default="nmos", help="cifar10 | nmos | dataset | ImageFolder 根目錄")
+    p.add_argument("--data-root", type=str, default="data")
+    p.add_argument("--dataset-root", type=str, default="dataset", help="dataset 根目錄（內含 nmos/ 與 dienumbers/）")
+    p.add_argument("--nmos-dir", type=str, default="nmos", help="nmos 資料夾（評估時若權重內有 nmos_dir 則優先使用）")
+    p.add_argument("--nmos-val-ratio", type=float, default=0.3)
+    p.add_argument("--nmos-test-ratio", type=float, default=0.0)
+    p.add_argument("--split-seed", type=int, default=42)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--device", type=str, default="")
+    p.add_argument("--preprocess", type=str, default="", help="留空則沿用權重內設定；可指定 none|p10")
+    p.add_argument(
+        "--max-test-samples",
+        type=int,
+        default=0,
+        help="評估時最多使用的測試張數（預設 0；<=0 表示使用全部測試集）",
+    )
+    p.add_argument(
+        "--per-image-csv",
+        type=str,
+        default="",
+        help="逐張 GT/預測輸出 CSV；留空則 results_classic/<arch>/<arch>_per_image_predictions.csv",
+    )
+    p.add_argument("--no-per-image-csv", action="store_true", help="不寫逐張預測 CSV")
+    p.add_argument(
+        "--dataset-test-split",
+        type=str,
+        default="combined",
+        choices=("combined", "nmos", "dienumbers", "separate"),
+        help="dataset 模式：測試集來源；separate 會各跑一次並輸出兩份 metrics/csv",
+    )
+    args = p.parse_args()
+
+    device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_str)
+
+    if args.weights:
+        wpath = Path(args.weights)
+    elif args.arch:
+        wpath = _ROOT / "runs_classic" / args.arch / "best.pt"
+    else:
+        raise SystemExit("請提供 --weights，或同時用 --arch（例如 lenet）以自動找 runs_classic/<arch>/best.pt")
+
+    if not wpath.is_file():
+        raise FileNotFoundError(f"找不到權重: {wpath}")
+
+    ckpt = torch.load(wpath, map_location=device)
+    arch = ckpt["arch"]
+    num_classes = int(ckpt["num_classes"])
+    model = build_model(arch, num_classes).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    ds = args.dataset.lower()
+    ckpt_preprocess = str(ckpt.get("preprocess", "none")).lower()
+    preprocess = (args.preprocess or ckpt_preprocess).lower()
+    if preprocess not in {"none", "p10"}:
+        raise ValueError("preprocess 只支援 none 或 p10")
+
+    class_names: list[str] = []
+    eval_jobs: list[tuple[str, list[str], DataLoader, str | None]] = []
+
+    if ds == "cifar10":
+        image_ids, loader = get_cifar10_test_ids_and_loader(
+            Path(args.data_root), arch, args.batch_size, args.workers
+        )
+        class_names = list(CIFAR10_CLASS_NAMES)
+        eval_jobs = [("", image_ids, loader, None)]
+    elif ds == "nmos":
+        nmos_dir = ckpt.get("nmos_dir") or args.nmos_dir
+        nmos_root = Path(nmos_dir)
+        if not nmos_root.is_absolute():
+            nmos_root = _ROOT / nmos_root
+        vr = float(ckpt.get("nmos_val_ratio", args.nmos_val_ratio))
+        tr = float(ckpt.get("nmos_test_ratio", args.nmos_test_ratio))
+        sd = int(ckpt.get("split_seed", args.split_seed))
+        image_ids, loader = get_nmos_test_paths_and_loader(
+            nmos_root, arch, args.batch_size, args.workers, vr, tr, preprocess, sd
+        )
+        raw_names = ckpt.get("class_names")
+        if isinstance(raw_names, list) and len(raw_names) == num_classes:
+            class_names = [str(x) for x in raw_names]
+        else:
+            class_names = [str(i) for i in range(num_classes)]
+        eval_jobs = [("", image_ids, loader, None)]
+    elif ds == "dataset":
+        dataset_root = ckpt.get("dataset_root") or args.dataset_root
+        root = Path(dataset_root)
+        if not root.is_absolute():
+            root = _ROOT / root
+        vr = float(ckpt.get("nmos_val_ratio", args.nmos_val_ratio))
+        sd = int(ckpt.get("split_seed", args.split_seed))
+        raw_names = ckpt.get("class_names")
+        if isinstance(raw_names, list) and len(raw_names) == num_classes:
+            class_names = [str(x) for x in raw_names]
+        else:
+            class_names = [str(i) for i in range(num_classes)]
+        # dataset 模式直接讀 dataset/test 下完整測試集；不再全域二次截斷。
+        args.max_test_samples = 0
+        split_arg = args.dataset_test_split.lower()
+        if split_arg == "separate":
+            for tag in ("nmos", "dienumbers"):
+                iids, ld = get_dataset_eval_paths_and_loader(
+                    root, arch, args.batch_size, args.workers, vr, preprocess, sd, test_split=tag
+                )
+                eval_jobs.append((f"_{tag}", iids, ld, tag))
+        elif split_arg in ("nmos", "dienumbers"):
+            iids, ld = get_dataset_eval_paths_and_loader(
+                root, arch, args.batch_size, args.workers, vr, preprocess, sd, test_split=split_arg
+            )
+            eval_jobs.append((f"_{split_arg}", iids, ld, split_arg))
+        else:
+            iids, ld = get_dataset_eval_paths_and_loader(
+                root, arch, args.batch_size, args.workers, vr, preprocess, sd, test_split="combined"
+            )
+            eval_jobs.append(("", iids, ld, "combined"))
+    else:
+        image_ids, loader, if_classes = get_imagefolder_test_paths_and_loader(
+            Path(args.dataset), arch, args.batch_size, args.workers
+        )
+        class_names = [str(c) for c in if_classes]
+        eval_jobs = [("", image_ids, loader, None)]
+
+    outputs: list[dict] = []
+    for metrics_suffix, iids, ld, dts in eval_jobs:
+        iids2, ld2 = _cap_test_samples(iids, ld, args.max_test_samples)
+        pl = _evaluate_loader_and_write(
+            model=model,
+            device=device,
+            arch=arch,
+            num_classes=num_classes,
+            class_names=class_names,
+            image_ids=iids2,
+            loader=ld2,
+            preprocess=preprocess,
+            wpath=wpath,
+            metrics_basename_suffix=metrics_suffix,
+            per_image_csv_arg=args.per_image_csv,
+            no_per_image_csv=args.no_per_image_csv,
+            max_test_samples=args.max_test_samples,
+            dataset_test_split=dts,
+        )
+        outputs.append(pl)
+
+    if len(outputs) == 1:
+        print(json.dumps(outputs[0], indent=2, ensure_ascii=False))
+    else:
+        keys = [j[3] for j in eval_jobs]
+        print(json.dumps(dict(zip(keys, outputs)), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

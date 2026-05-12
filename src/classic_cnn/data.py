@@ -144,53 +144,65 @@ _NMOS_STEM_RE = re.compile(r"^(\d{6})")
 _DIENUM_STEM_RE = re.compile(r"^([A-Za-z]\d)")
 
 
-def _apply_p10_preprocess(img: Image.Image) -> Image.Image:
-    """
-    套用 visualize_p10_steps.py 的 P10 強化流程（不含視覺化輸出），並且從原圖抽取指定區塊後餵給分類器。
+def _slice_grid_bounds(h: int, w: int) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """與 visualize_p10_steps.py 一致：3 rows x 2 cols（row/col 以百分比切割）。"""
+    row_bounds = [(0, int(h * 0.4)), (int(h * 0.3), int(h * 0.7)), (int(h * 0.6), h)]
+    col_bounds = [(0, int(w * 0.6)), (int(w * 0.4), w)]
+    return row_bounds, col_bounds
 
-    區塊定義（對應 visualize_p10_steps.py 的切割規則）：
-    - 取 `r1_c1`、`r2_c1`、`r3_c2`
-    - 其餘位置視為固定資訊（不納入輸入）
-    - 三個區塊各自跑完 P10，最後以 RGB channel 疊合：
-      - R = P10(r1_c1)
-      - G = P10(r2_c1)
-      - B = P10(r3_c2)
+
+def _p10_from_block(block: np.ndarray) -> np.ndarray:
+    """對單一灰階區塊跑完 P10，回傳最終 uint8 灰階影像。"""
+    resized = cv2.resize(block, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
+    _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    v_kernel = np.ones((7, 1), np.uint8)
+    dilated = cv2.dilate(thresh, v_kernel, iterations=1)
+    inverted = cv2.bitwise_not(dilated)
+    final = cv2.copyMakeBorder(
+        inverted,
+        50,
+        50,
+        50,
+        50,
+        cv2.BORDER_CONSTANT,
+        value=255,
+    )
+    return final
+
+
+def _stack_p10_channels(channels: list[np.ndarray]) -> Image.Image:
+    """將多張 P10 灰階圖 resize 成與第一張相同尺寸後疊成 RGB（最多 3 張；不足則重複最後一張）。"""
+    if not channels:
+        raise ValueError("channels 不可為空")
+    base = channels[0]
+    th, tw = base.shape[:2]
+    aligned: list[np.ndarray] = []
+    for ch in channels:
+        if ch.shape[:2] != (th, tw):
+            ch = cv2.resize(ch, (tw, th), interpolation=cv2.INTER_CUBIC)
+        aligned.append(ch)
+    while len(aligned) < 3:
+        aligned.append(aligned[-1])
+    out = np.stack(aligned[:3], axis=-1)
+    return Image.fromarray(out)
+
+
+def _apply_p10_preprocess_nmos(img: Image.Image) -> Image.Image:
+    """
+    nmos：取 `r1_c1`、`r2_c1`、`r3_c2`，各自 P10 後以 RGB 疊合：
+    R = P10(r1_c1), G = P10(r2_c1), B = P10(r3_c2)
     """
     arr = np.array(img.convert("L"))
     h, w = arr.shape[:2]
+    row_bounds, col_bounds = _slice_grid_bounds(h, w)
 
-    # 與 visualize_p10_steps.py 一致：3 rows x 2 cols（row/col 以百分比切割）
-    row_bounds = [(0, int(h * 0.4)), (int(h * 0.3), int(h * 0.7)), (int(h * 0.6), h)]
-    col_bounds = [(0, int(w * 0.6)), (int(w * 0.4), w)]
-
-    def _p10_from_block(block: np.ndarray) -> np.ndarray:
-        """對單一灰階區塊跑完 P10，回傳最終 uint8 灰階影像。"""
-        resized = cv2.resize(block, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
-        _, thresh = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        v_kernel = np.ones((7, 1), np.uint8)
-        dilated = cv2.dilate(thresh, v_kernel, iterations=1)
-        inverted = cv2.bitwise_not(dilated)
-        final = cv2.copyMakeBorder(
-            inverted,
-            50,
-            50,
-            50,
-            50,
-            cv2.BORDER_CONSTANT,
-            value=255,
-        )
-        return final
-
-    # r1_c1
     r1_start, r1_end = row_bounds[0]
     c1_start, c1_end = col_bounds[0]
     b1 = arr[r1_start:r1_end, c1_start:c1_end]
 
-    # r2_c1
     r2_start, r2_end = row_bounds[1]
     b2 = arr[r2_start:r2_end, c1_start:c1_end]
 
-    # r3_c2
     r3_start, r3_end = row_bounds[2]
     c2_start, c2_end = col_bounds[1]
     b3 = arr[r3_start:r3_end, c2_start:c2_end]
@@ -198,17 +210,29 @@ def _apply_p10_preprocess(img: Image.Image) -> Image.Image:
     p1 = _p10_from_block(b1)
     p2 = _p10_from_block(b2)
     p3 = _p10_from_block(b3)
+    return _stack_p10_channels([p1, p2, p3])
 
-    # 三個區塊轉成 RGB（其它位置不提供，等價於固定/不使用）
-    # 注意：由於切割邊界用 int(h*ratio) 會有「±1 像素」誤差，
-    # 所以 P10 後尺寸可能不完全一致；疊合前先 resize 成同尺寸。
-    th, tw = p1.shape[:2]
-    if p2.shape[:2] != (th, tw):
-        p2 = cv2.resize(p2, (tw, th), interpolation=cv2.INTER_CUBIC)
-    if p3.shape[:2] != (th, tw):
-        p3 = cv2.resize(p3, (tw, th), interpolation=cv2.INTER_CUBIC)
-    out = np.stack([p1, p2, p3], axis=-1)  # HWC, uint8
-    return Image.fromarray(out)
+
+def _apply_p10_preprocess_dienumbers(img: Image.Image) -> Image.Image:
+    """
+    dienumbers：僅取第一列 `r1_c1`、`r1_c2`，各自 P10 後疊成 RGB（第三通道重複 r1_c2 以維持 3 通道輸入）。
+    """
+    arr = np.array(img.convert("L"))
+    h, w = arr.shape[:2]
+    row_bounds, col_bounds = _slice_grid_bounds(h, w)
+    r1_start, r1_end = row_bounds[0]
+    c1_start, c1_end = col_bounds[0]
+    c2_start, c2_end = col_bounds[1]
+    b1 = arr[r1_start:r1_end, c1_start:c1_end]
+    b2 = arr[r1_start:r1_end, c2_start:c2_end]
+    p1 = _p10_from_block(b1)
+    p2 = _p10_from_block(b2)
+    return _stack_p10_channels([p1, p2, p2])
+
+
+def _apply_p10_preprocess(img: Image.Image) -> Image.Image:
+    """向後相容：預設使用 nmos 區塊組合。"""
+    return _apply_p10_preprocess_nmos(img)
 
 
 def collect_nmos_samples(nmos_root: Path) -> tuple[list[Path], list[int], list[str]]:
@@ -271,8 +295,8 @@ def collect_dienumbers_samples(dienumbers_root: Path) -> tuple[list[Path], list[
     return paths, labels, codes
 
 
-def collect_dataset_samples(dataset_root: Path) -> tuple[list[Path], list[int], list[str]]:
-    """讀取 dataset/nmos + dataset/dienumbers，合併成同一分類空間。"""
+def collect_dataset_samples(dataset_root: Path) -> tuple[list[Path], list[int], list[str], list[str]]:
+    """讀取 dataset/nmos + dataset/dienumbers，合併成同一分類空間；並回傳每筆樣本來源（nmos / dienumbers）。"""
     nmos_root = dataset_root / "nmos"
     die_root = dataset_root / "dienumbers"
     if not nmos_root.is_dir() or not die_root.is_dir():
@@ -295,25 +319,43 @@ def collect_dataset_samples(dataset_root: Path) -> tuple[list[Path], list[int], 
     paths = sorted(n_paths + d_paths)
     labels: list[int] = []
     kept_paths: list[Path] = []
+    sample_sources: list[str] = []
     for p in paths:
         code = _code_from_path(p)
         if code is None:
             continue
         kept_paths.append(p)
         labels.append(str_to_idx[code])
+        parent = p.parent.name.lower()
+        if parent == "nmos":
+            sample_sources.append("nmos")
+        elif parent == "dienumbers":
+            sample_sources.append("dienumbers")
+        else:
+            sample_sources.append("nmos")
     if not kept_paths:
         raise ValueError(f"{dataset_root} 內沒有可用樣本")
-    return kept_paths, labels, class_names
+    return kept_paths, labels, class_names, sample_sources
 
 
 class NmosDataset(Dataset):
-    def __init__(self, paths: list[Path], labels: list[int], transform, preprocess: str = "none") -> None:
+    def __init__(
+        self,
+        paths: list[Path],
+        labels: list[int],
+        transform,
+        preprocess: str = "none",
+        sample_sources: list[str] | None = None,
+    ) -> None:
         self.paths = paths
         self.labels = labels
         self.transform = transform
         self.preprocess = preprocess.lower()
         if self.preprocess not in {"none", "p10"}:
             raise ValueError(f"不支援 preprocess={preprocess}，可用值：none, p10")
+        if sample_sources is not None and len(sample_sources) != len(paths):
+            raise ValueError("sample_sources 長度須與 paths 相同")
+        self.sample_sources = sample_sources
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -321,7 +363,11 @@ class NmosDataset(Dataset):
     def __getitem__(self, i: int):
         img = Image.open(self.paths[i]).convert("RGB")
         if self.preprocess == "p10":
-            img = _apply_p10_preprocess(img)
+            src = (self.sample_sources[i] if self.sample_sources else "nmos").lower()
+            if src == "dienumbers":
+                img = _apply_p10_preprocess_dienumbers(img)
+            else:
+                img = _apply_p10_preprocess_nmos(img)
         x = self.transform(img)
         return x, self.labels[i]
 
@@ -496,15 +542,21 @@ def get_dataset_loaders(
     preprocess: str = "none",
     seed: int = 42,
 ) -> tuple[DataLoader, DataLoader, int, list[str]]:
-    paths, labels, class_names = collect_dataset_samples(dataset_root)
+    paths, labels, class_names, sample_sources = collect_dataset_samples(dataset_root)
     train_idx, val_idx = _train_val_indices(labels, val_ratio, seed)
     tr_paths = [paths[i] for i in train_idx]
     tr_labels = [labels[i] for i in train_idx]
+    tr_sources = [sample_sources[i] for i in train_idx]
     va_paths = [paths[i] for i in val_idx]
     va_labels = [labels[i] for i in val_idx]
+    va_sources = [sample_sources[i] for i in val_idx]
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    train_ds = NmosDataset(tr_paths, tr_labels, transforms_nmos(arch, True), preprocess=preprocess)
-    val_ds = NmosDataset(va_paths, va_labels, transforms_nmos(arch, False), preprocess=preprocess)
+    train_ds = NmosDataset(
+        tr_paths, tr_labels, transforms_nmos(arch, True), preprocess=preprocess, sample_sources=tr_sources
+    )
+    val_ds = NmosDataset(
+        va_paths, va_labels, transforms_nmos(arch, False), preprocess=preprocess, sample_sources=va_sources
+    )
     return DataLoader(train_ds, shuffle=True, **kw), DataLoader(val_ds, shuffle=False, **kw), len(class_names), class_names
 
 
@@ -516,11 +568,17 @@ def get_dataset_eval_paths_and_loader(
     val_ratio: float,
     preprocess: str = "none",
     seed: int = 42,
+    test_split: str = "combined",
 ) -> tuple[list[str], DataLoader]:
     """
-    從 dataset/test/nmos 與 dataset/test/dienumbers 讀取完整測試集：
+    從 dataset/test/nmos 與 dataset/test/dienumbers 讀取測試集：
     - nmos: 檔名前 6 碼
     - dienumbers: 檔名前 2 碼（1 英文 + 1 數字）
+
+    test_split:
+    - combined：兩者合併（預設）
+    - nmos：僅 test/nmos
+    - dienumbers：僅 test/dienumbers
     """
     del val_ratio, seed
     test_root = dataset_root / "test"
@@ -529,26 +587,44 @@ def get_dataset_eval_paths_and_loader(
     if not nmos_root.is_dir() or not die_root.is_dir():
         raise FileNotFoundError(f"需要 {dataset_root}/test/nmos 與 {dataset_root}/test/dienumbers")
 
-    _, _, class_names = collect_dataset_samples(dataset_root)
+    _, _, class_names, _ = collect_dataset_samples(dataset_root)
     str_to_idx = {c: i for i, c in enumerate(class_names)}
 
     nmos_paths, _, _ = collect_nmos_samples(nmos_root)
     die_paths, _, _ = collect_dienumbers_samples(die_root)
 
-    te_paths = sorted(nmos_paths + die_paths)
+    ts = test_split.lower().strip()
+    if ts == "nmos":
+        te_paths = sorted(nmos_paths)
+    elif ts in {"dienumbers", "die"}:
+        te_paths = sorted(die_paths)
+    elif ts in {"combined", "all", ""}:
+        te_paths = sorted(nmos_paths + die_paths)
+    else:
+        raise ValueError("test_split 須為 combined | nmos | dienumbers")
+
     te_labels: list[int] = []
+    te_sources: list[str] = []
     for p in te_paths:
         m6 = _NMOS_STEM_RE.match(p.stem)
         if m6:
             te_labels.append(str_to_idx[m6.group(1)])
+            te_sources.append("nmos")
             continue
         m2 = _DIENUM_STEM_RE.match(p.stem)
         if m2:
             te_labels.append(str_to_idx[m2.group(1).upper()])
+            te_sources.append("dienumbers")
             continue
         raise ValueError(f"測試檔名不符合規則: {p.name}")
 
-    ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False), preprocess=preprocess)
+    ds = NmosDataset(
+        te_paths,
+        te_labels,
+        transforms_nmos(arch, False),
+        preprocess=preprocess,
+        sample_sources=te_sources,
+    )
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
     loader = DataLoader(ds, shuffle=False, **kw)
     return [str(p.resolve()) for p in te_paths], loader
