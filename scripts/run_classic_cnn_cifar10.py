@@ -11,10 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
 
 ARCHS = (
-    "lenet",
-    "alexnet",
-    "vgg11",
-    "nin",
+   # "lenet",
+    #"alexnet",
+    #"vgg11",
+    #"nin",
     "googlenet",
     "resnet18",
     "densenet121",
