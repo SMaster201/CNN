@@ -26,6 +26,53 @@ from src.classic_cnn.data import (
 from src.classic_cnn.models import ARCH_CHOICES, build_model
 
 
+def _save_training_curves(
+    out_dir: Path,
+    train_losses: list[float],
+    val_accs: list[float],
+    arch: str,
+) -> tuple[Path, Path]:
+    """儲存訓練 loss / 驗證準確率曲線（PNG + JSON）。"""
+    history = {
+        "arch": arch,
+        "epoch": list(range(1, len(train_losses) + 1)),
+        "train_loss": train_losses,
+        "val_acc": val_accs,
+    }
+    json_path = out_dir / "training_curves.json"
+    json_path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    png_path = out_dir / "training_curves.png"
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        epochs = history["epoch"]
+        fig, ax1 = plt.subplots(figsize=(8, 4.5))
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Train loss", color="tab:blue")
+        ax1.plot(epochs, train_losses, color="tab:blue", label="train loss")
+        ax1.tick_params(axis="y", labelcolor="tab:blue")
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = ax1.twinx()
+        ax2.set_ylabel("Val accuracy", color="tab:orange")
+        ax2.plot(epochs, val_accs, color="tab:orange", label="val acc")
+        ax2.tick_params(axis="y", labelcolor="tab:orange")
+
+        fig.suptitle(f"{arch} training curves")
+        fig.tight_layout()
+        fig.savefig(png_path, dpi=150)
+        plt.close(fig)
+    except ImportError:
+        print("未安裝 matplotlib，略過曲線圖（已寫入 training_curves.json）", flush=True)
+        png_path = json_path
+
+    return json_path, png_path
+
+
 def _parse_image_size_arg(ns: argparse.Namespace) -> tuple[int, int] | None:
     if ns.image_size is None:
         return None
@@ -76,6 +123,7 @@ def main() -> None:
         default=None,
         help="Resize 高度與寬度；未指定則依架構使用 224×224 或 32×32",
     )
+    p.add_argument("--no-plot", action="store_true", help="不輸出訓練曲線圖")
     args = p.parse_args()
 
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -183,6 +231,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     best_val = 0.0
+    train_losses: list[float] = []
+    val_accs: list[float] = []
     t0 = time.perf_counter()
     for epoch in range(args.epochs):
         model.train()
@@ -207,6 +257,8 @@ def main() -> None:
                 correct += (pred == y).sum().item()
                 tot += y.size(0)
         acc = correct / max(tot, 1)
+        train_losses.append(total_loss / max(n, 1))
+        val_accs.append(acc)
         if acc >= best_val:
             best_val = acc
             ckpt: dict = {
@@ -234,8 +286,19 @@ def main() -> None:
     }
     if nmos_meta is not None:
         meta.update(nmos_meta)
+
+    curves_json: Path | None = None
+    curves_png: Path | None = None
+    if not args.no_plot and train_losses:
+        curves_json, curves_png = _save_training_curves(out_dir, train_losses, val_accs, args.arch)
+        meta["training_curves_json"] = str(curves_json.resolve())
+        if curves_png.suffix.lower() == ".png":
+            meta["training_curves_png"] = str(curves_png.resolve())
+
     (out_dir / "training_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"完成。權重：{out_dir / 'best.pt'}，耗時 {elapsed:.1f}s")
+    if curves_png is not None and curves_png.suffix.lower() == ".png":
+        print(f"訓練曲線：{curves_png}")
 
 
 if __name__ == "__main__":

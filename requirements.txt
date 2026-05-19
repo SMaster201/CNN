@@ -9,3 +9,7 @@ Pillow>=9.0.0
 
 # 經典 CNN：GFLOPs 估算
 thop>=0.1.1
+
+# 訓練曲線圖
+matplotlib>=3.7.0
+opencv-python>=4.8.0
