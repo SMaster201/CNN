@@ -15,8 +15,23 @@ if str(_ROOT) not in sys.path:
 import torch
 import torch.nn as nn
 
-from src.classic_cnn.data import get_cifar10_loaders, get_dataset_loaders, get_imagefolder_loaders, get_nmos_loaders
+from src.classic_cnn.data import (
+    get_cifar10_loaders,
+    get_dataset_loaders,
+    get_dienumbers_loaders,
+    get_imagefolder_loaders,
+    get_nmos_loaders,
+    resolve_image_size,
+)
 from src.classic_cnn.models import ARCH_CHOICES, build_model
+
+
+def _parse_image_size_arg(ns: argparse.Namespace) -> tuple[int, int] | None:
+    if ns.image_size is None:
+        return None
+    if len(ns.image_size) != 2:
+        raise ValueError("--image-size 須提供兩個整數：高度 寬度")
+    return int(ns.image_size[0]), int(ns.image_size[1])
 
 
 def main() -> None:
@@ -26,10 +41,16 @@ def main() -> None:
         "--dataset",
         type=str,
         default="nmos",
-        help="cifar10 | nmos | ImageFolder 根目錄（內含 train/、val/）",
+        help="cifar10 | nmos | dataset | dienumbers | ImageFolder 根目錄",
     )
     p.add_argument("--data-root", type=str, default="data", help="CIFAR-10 下載目錄（dataset=cifar10 時）")
     p.add_argument("--dataset-root", type=str, default="dataset", help="dataset 根目錄（內含 nmos/ 與 dienumbers/）")
+    p.add_argument(
+        "--dienumbers-dir",
+        type=str,
+        default="",
+        help="dienumbers 訓練資料夾；留空則用 <dataset-root>/dienumbers",
+    )
     p.add_argument("--nmos-dir", type=str, default="nmos", help="nmos 扁平影像資料夾（相對專案根或絕對路徑）")
     p.add_argument("--nmos-val-ratio", type=float, default=0.3, help="驗證集比例（預設 0.3；train≈70%）")
     p.add_argument("--nmos-test-ratio", type=float, default=0.0, help="測試集比例（nmos 模式可用；預設 0）")
@@ -40,13 +61,30 @@ def main() -> None:
     p.add_argument("--val-ratio", type=float, default=0.1)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--device", type=str, default="")
-    p.add_argument("--preprocess", type=str, default="p10", choices=("none", "p10"), help="訓練/驗證前處理流程")
+    p.add_argument(
+        "--preprocess",
+        type=str,
+        default=None,
+        choices=("none", "p10"),
+        help="前處理；dienumbers 模式預設 none，其餘預設 p10",
+    )
+    p.add_argument(
+        "--image-size",
+        type=int,
+        nargs=2,
+        metavar=("H", "W"),
+        default=None,
+        help="Resize 高度與寬度；未指定則依架構使用 224×224 或 32×32",
+    )
     args = p.parse_args()
 
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
+    image_size = _parse_image_size_arg(args)
 
     ds = args.dataset.lower()
+    if args.preprocess is None:
+        args.preprocess = "none" if ds == "dienumbers" else "p10"
     class_names: list[str] | None = None
     nmos_meta: dict | None = None
 
@@ -69,6 +107,7 @@ def main() -> None:
             args.workers,
             preprocess=args.preprocess,
             seed=args.split_seed,
+            image_size=image_size,
         )
         nmos_meta = {
             "nmos_dir": str(nmos_root.resolve()),
@@ -77,6 +116,7 @@ def main() -> None:
             "split_seed": int(args.split_seed),
             "preprocess": args.preprocess,
             "class_names": class_names,
+            "image_size": list(resolve_image_size(args.arch, image_size)),
         }
     elif ds == "dataset":
         dataset_root = Path(args.dataset_root)
@@ -90,6 +130,7 @@ def main() -> None:
             args.workers,
             preprocess=args.preprocess,
             seed=args.split_seed,
+            image_size=image_size,
         )
         test_loader = val_loader
         nmos_meta = {
@@ -98,6 +139,35 @@ def main() -> None:
             "split_seed": int(args.split_seed),
             "preprocess": args.preprocess,
             "class_names": class_names,
+            "image_size": list(resolve_image_size(args.arch, image_size)),
+        }
+    elif ds == "dienumbers":
+        dataset_root = Path(args.dataset_root)
+        if not dataset_root.is_absolute():
+            dataset_root = _ROOT / dataset_root
+        die_root = Path(args.dienumbers_dir) if args.dienumbers_dir else (dataset_root / "dienumbers")
+        if not die_root.is_absolute():
+            die_root = _ROOT / die_root
+        train_loader, val_loader, num_classes, class_names = get_dienumbers_loaders(
+            die_root,
+            args.arch,
+            args.batch_size,
+            args.nmos_val_ratio,
+            args.workers,
+            preprocess=args.preprocess,
+            seed=args.split_seed,
+            image_size=image_size,
+        )
+        test_loader = val_loader
+        nmos_meta = {
+            "dataset": "dienumbers",
+            "dataset_root": str(dataset_root.resolve()),
+            "dienumbers_dir": str(die_root.resolve()),
+            "nmos_val_ratio": float(args.nmos_val_ratio),
+            "split_seed": int(args.split_seed),
+            "preprocess": args.preprocess,
+            "class_names": class_names,
+            "image_size": list(resolve_image_size(args.arch, image_size)),
         }
     else:
         root = Path(args.dataset)

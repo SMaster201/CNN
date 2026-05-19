@@ -15,16 +15,25 @@ from torchvision import datasets, transforms
 from src.classic_cnn.models import arch_uses_imagenet_224
 
 
-def transforms_nmos(arch: str, train: bool) -> transforms.Compose:
-    """nmos 工業影像：ImageNet 正規化（eval 不加 flip，避免 Lambda 無法於 Windows worker pickle）。"""
+def resolve_image_size(arch: str, image_size: tuple[int, int] | None) -> tuple[int, int]:
+    """未指定時依架構使用 224×224 或 32×32。"""
+    if image_size is not None:
+        h, w = int(image_size[0]), int(image_size[1])
+        if h <= 0 or w <= 0:
+            raise ValueError("image_size 的 H、W 須為正整數")
+        return h, w
+    return (224, 224) if arch_uses_imagenet_224(arch) else (32, 32)
+
+
+def transforms_nmos(
+    arch: str,
+    train: bool,
+    image_size: tuple[int, int] | None = None,
+) -> transforms.Compose:
+    """工業影像：ImageNet 正規化（eval 不加 flip，避免 Lambda 無法於 Windows worker pickle）。"""
     norm = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-    if arch_uses_imagenet_224(arch):
-        ops: list = [transforms.Resize((224, 224))]
-        if train:
-            ops.append(transforms.RandomHorizontalFlip())
-        ops.extend([transforms.ToTensor(), norm])
-        return transforms.Compose(ops)
-    ops = [transforms.Resize((32, 32))]
+    h, w = resolve_image_size(arch, image_size)
+    ops: list = [transforms.Resize((h, w))]
     if train:
         ops.append(transforms.RandomHorizontalFlip())
     ops.extend([transforms.ToTensor(), norm])
@@ -472,6 +481,7 @@ def get_nmos_loaders(
     num_workers: int,
     preprocess: str = "none",
     seed: int = 42,
+    image_size: tuple[int, int] | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader, int, list[str]]:
     paths, labels, class_names = collect_nmos_samples(nmos_root)
     train_idx, val_idx, test_idx = _nmos_train_val_test_indices(labels, val_ratio, test_ratio, seed)
@@ -483,9 +493,15 @@ def get_nmos_loaders(
     te_labels = [labels[i] for i in test_idx]
     num_classes = len(class_names)
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    train_ds = NmosDataset(tr_paths, tr_labels, transforms_nmos(arch, True), preprocess=preprocess)
-    val_ds = NmosDataset(va_paths, va_labels, transforms_nmos(arch, False), preprocess=preprocess)
-    test_ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False), preprocess=preprocess)
+    train_ds = NmosDataset(
+        tr_paths, tr_labels, transforms_nmos(arch, True, image_size), preprocess=preprocess
+    )
+    val_ds = NmosDataset(
+        va_paths, va_labels, transforms_nmos(arch, False, image_size), preprocess=preprocess
+    )
+    test_ds = NmosDataset(
+        te_paths, te_labels, transforms_nmos(arch, False, image_size), preprocess=preprocess
+    )
     return (
         DataLoader(train_ds, shuffle=True, **kw),
         DataLoader(val_ds, shuffle=False, **kw),
@@ -504,13 +520,16 @@ def get_nmos_test_paths_and_loader(
     test_ratio: float,
     preprocess: str = "none",
     seed: int = 42,
+    image_size: tuple[int, int] | None = None,
 ) -> tuple[list[str], DataLoader]:
     """與 get_nmos_loaders 相同測試切分；回傳絕對路徑字串列表（與 batch 順序一致）。"""
     paths, labels, _ = collect_nmos_samples(nmos_root)
     _, _, test_idx = _nmos_train_val_test_indices(labels, val_ratio, test_ratio, seed)
     te_paths = [paths[i] for i in test_idx]
     te_labels = [labels[i] for i in test_idx]
-    test_ds = NmosDataset(te_paths, te_labels, transforms_nmos(arch, False), preprocess=preprocess)
+    test_ds = NmosDataset(
+        te_paths, te_labels, transforms_nmos(arch, False, image_size), preprocess=preprocess
+    )
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
     loader = DataLoader(test_ds, shuffle=False, **kw)
     return [str(p.resolve()) for p in te_paths], loader
@@ -525,12 +544,100 @@ def get_nmos_test_loader(
     test_ratio: float,
     preprocess: str = "none",
     seed: int = 42,
+    image_size: tuple[int, int] | None = None,
 ) -> DataLoader:
     """與 get_nmos_loaders 相同切分，僅回傳測試集 DataLoader。"""
     _, loader = get_nmos_test_paths_and_loader(
-        nmos_root, arch, batch_size, num_workers, val_ratio, test_ratio, preprocess, seed
+        nmos_root, arch, batch_size, num_workers, val_ratio, test_ratio, preprocess, seed, image_size
     )
     return loader
+
+
+def get_dienumbers_loaders(
+    dienumbers_root: Path,
+    arch: str,
+    batch_size: int,
+    val_ratio: float,
+    num_workers: int,
+    preprocess: str = "none",
+    seed: int = 42,
+    image_size: tuple[int, int] | None = None,
+) -> tuple[DataLoader, DataLoader, int, list[str]]:
+    """僅 dienumbers 扁平資料夾：train/val 分層切分。"""
+    paths, labels, class_names = collect_dienumbers_samples(dienumbers_root)
+    train_idx, val_idx = _train_val_indices(labels, val_ratio, seed)
+    tr_paths = [paths[i] for i in train_idx]
+    tr_labels = [labels[i] for i in train_idx]
+    va_paths = [paths[i] for i in val_idx]
+    va_labels = [labels[i] for i in val_idx]
+    kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    die_sources = ["dienumbers"] * len(tr_paths)
+    va_sources = ["dienumbers"] * len(va_paths)
+    train_ds = NmosDataset(
+        tr_paths,
+        tr_labels,
+        transforms_nmos(arch, True, image_size),
+        preprocess=preprocess,
+        sample_sources=die_sources,
+    )
+    val_ds = NmosDataset(
+        va_paths,
+        va_labels,
+        transforms_nmos(arch, False, image_size),
+        preprocess=preprocess,
+        sample_sources=va_sources,
+    )
+    return (
+        DataLoader(train_ds, shuffle=True, **kw),
+        DataLoader(val_ds, shuffle=False, **kw),
+        len(class_names),
+        class_names,
+    )
+
+
+def get_dienumbers_eval_paths_and_loader(
+    dataset_root: Path,
+    arch: str,
+    batch_size: int,
+    num_workers: int,
+    preprocess: str = "none",
+    image_size: tuple[int, int] | None = None,
+    dienumbers_train_root: Path | None = None,
+) -> tuple[list[str], DataLoader, list[str]]:
+    """
+    從 dataset/test/dienumbers 讀取測試集；類別空間與訓練用 dienumbers 目錄一致。
+    dienumbers_train_root 預設為 dataset_root/dienumbers。
+    """
+    train_root = dienumbers_train_root or (dataset_root / "dienumbers")
+    _, _, class_names = collect_dienumbers_samples(train_root)
+    str_to_idx = {c: i for i, c in enumerate(class_names)}
+
+    test_root = dataset_root / "test" / "dienumbers"
+    if not test_root.is_dir():
+        raise FileNotFoundError(f"需要 {test_root}")
+
+    te_paths, _, _ = collect_dienumbers_samples(test_root)
+    te_labels: list[int] = []
+    for p in te_paths:
+        m2 = _DIENUM_STEM_RE.match(p.stem)
+        if not m2:
+            raise ValueError(f"測試檔名不符合規則: {p.name}")
+        code = m2.group(1).upper()
+        if code not in str_to_idx:
+            raise ValueError(f"測試類別 {code} 不在訓練類別清單中（請確認訓練/測試 dienumbers 一致）")
+        te_labels.append(str_to_idx[code])
+
+    te_sources = ["dienumbers"] * len(te_paths)
+    ds = NmosDataset(
+        te_paths,
+        te_labels,
+        transforms_nmos(arch, False, image_size),
+        preprocess=preprocess,
+        sample_sources=te_sources,
+    )
+    kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    loader = DataLoader(ds, shuffle=False, **kw)
+    return [str(p.resolve()) for p in te_paths], loader, class_names
 
 
 def get_dataset_loaders(
@@ -541,6 +648,7 @@ def get_dataset_loaders(
     num_workers: int,
     preprocess: str = "none",
     seed: int = 42,
+    image_size: tuple[int, int] | None = None,
 ) -> tuple[DataLoader, DataLoader, int, list[str]]:
     paths, labels, class_names, sample_sources = collect_dataset_samples(dataset_root)
     train_idx, val_idx = _train_val_indices(labels, val_ratio, seed)
@@ -552,10 +660,18 @@ def get_dataset_loaders(
     va_sources = [sample_sources[i] for i in val_idx]
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=torch.cuda.is_available())
     train_ds = NmosDataset(
-        tr_paths, tr_labels, transforms_nmos(arch, True), preprocess=preprocess, sample_sources=tr_sources
+        tr_paths,
+        tr_labels,
+        transforms_nmos(arch, True, image_size),
+        preprocess=preprocess,
+        sample_sources=tr_sources,
     )
     val_ds = NmosDataset(
-        va_paths, va_labels, transforms_nmos(arch, False), preprocess=preprocess, sample_sources=va_sources
+        va_paths,
+        va_labels,
+        transforms_nmos(arch, False, image_size),
+        preprocess=preprocess,
+        sample_sources=va_sources,
     )
     return DataLoader(train_ds, shuffle=True, **kw), DataLoader(val_ds, shuffle=False, **kw), len(class_names), class_names
 
@@ -569,6 +685,7 @@ def get_dataset_eval_paths_and_loader(
     preprocess: str = "none",
     seed: int = 42,
     test_split: str = "combined",
+    image_size: tuple[int, int] | None = None,
 ) -> tuple[list[str], DataLoader]:
     """
     從 dataset/test/nmos 與 dataset/test/dienumbers 讀取測試集：
@@ -621,7 +738,7 @@ def get_dataset_eval_paths_and_loader(
     ds = NmosDataset(
         te_paths,
         te_labels,
-        transforms_nmos(arch, False),
+        transforms_nmos(arch, False, image_size),
         preprocess=preprocess,
         sample_sources=te_sources,
     )

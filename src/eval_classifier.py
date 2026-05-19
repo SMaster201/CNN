@@ -21,8 +21,10 @@ from torch.utils.data import DataLoader, Subset
 from src.classic_cnn.data import (
     get_cifar10_test_ids_and_loader,
     get_dataset_eval_paths_and_loader,
+    get_dienumbers_eval_paths_and_loader,
     get_imagefolder_test_paths_and_loader,
     get_nmos_test_paths_and_loader,
+    resolve_image_size,
 )
 from src.classic_cnn.models import arch_uses_imagenet_224, build_model
 
@@ -105,12 +107,12 @@ def _cap_test_samples(
     return image_ids[:n], DataLoader(sub, **kw)
 
 
-def _gflops(model: torch.nn.Module, arch: str) -> float | None:
+def _gflops(model: torch.nn.Module, arch: str, image_size: tuple[int, int] | None = None) -> float | None:
     try:
         m = model
         m.eval()
         dev = next(m.parameters()).device
-        h = w = 224 if arch_uses_imagenet_224(arch) else 32
+        h, w = resolve_image_size(arch, image_size)
         dummy = torch.zeros(1, 3, h, w, device=dev)
         flops, _ = profile(m, inputs=(dummy,), verbose=False)
         return float(flops) / 1e9
@@ -161,6 +163,60 @@ def _char_level_metrics(rows: list[dict]) -> dict:
     }
 
 
+def _per_class_accuracy(ys: list[int], ps: list[int], class_names: list[str]) -> dict[str, dict]:
+    """每個類別標籤（如 A3）的樣本數、正確數、準確率。"""
+    y = np.asarray(ys, dtype=np.int64)
+    p = np.asarray(ps, dtype=np.int64)
+    out: dict[str, dict] = {}
+    for c, name in enumerate(class_names):
+        mask = y == c
+        total = int(mask.sum())
+        if total == 0:
+            continue
+        correct = int((p[mask] == c).sum())
+        out[str(name)] = {
+            "total": total,
+            "correct": correct,
+            "accuracy": correct / total,
+        }
+    return out
+
+
+def _per_alnum_symbol_accuracy(rows: list[dict]) -> dict:
+    """
+    dienumbers 等 2 字元標籤：統計「有出現過」的英文字母（第 1 碼）與數字（第 2 碼）各自準確率。
+    """
+    letters: dict[str, dict[str, int]] = {}
+    digits: dict[str, dict[str, int]] = {}
+    for r in rows:
+        gt = str(r["gt_label"])
+        pr = str(r["pred_label"])
+        if len(gt) >= 1 and gt[0].isalpha():
+            ch = gt[0].upper()
+            letters.setdefault(ch, {"total": 0, "correct": 0})
+            letters[ch]["total"] += 1
+            if len(pr) >= 1 and pr[0].upper() == ch:
+                letters[ch]["correct"] += 1
+        if len(gt) >= 2 and gt[1].isdigit():
+            ch = gt[1]
+            digits.setdefault(ch, {"total": 0, "correct": 0})
+            digits[ch]["total"] += 1
+            if len(pr) >= 2 and pr[1] == ch:
+                digits[ch]["correct"] += 1
+
+    def _pack(d: dict[str, dict[str, int]]) -> dict[str, dict]:
+        return {
+            k: {
+                "total": v["total"],
+                "correct": v["correct"],
+                "accuracy": v["correct"] / v["total"] if v["total"] else 0.0,
+            }
+            for k, v in sorted(d.items())
+        }
+
+    return {"per_letter": _pack(letters), "per_digit": _pack(digits)}
+
+
 def _dataset_split_summary(rows: list[dict]) -> dict:
     nmos_total = 0
     nmos_correct = 0
@@ -199,6 +255,8 @@ def _evaluate_loader_and_write(
     no_per_image_csv: bool,
     max_test_samples: int,
     dataset_test_split: str | None = None,
+    image_size: tuple[int, int] | None = None,
+    report_alnum_accuracy: bool = False,
 ) -> dict:
     """跑單一 DataLoader 的推論並寫入 metrics（與可選 CSV）。"""
     out_dir = _ROOT / "results_classic" / arch
@@ -268,12 +326,14 @@ def _evaluate_loader_and_write(
     acc, prec, rec, f1 = _accuracy_and_macro_prf1(ys, ps, num_classes)
     ms_per_img = (t_infer / max(n_img, 1)) * 1000.0
     vram_mb = _peak_mb_safe(cuda_i)
-    gfl = _gflops(model, arch)
+    gfl = _gflops(model, arch, image_size)
+    resolved_size = list(resolve_image_size(arch, image_size))
 
     metrics_name = f"{arch}_metrics{metrics_basename_suffix}.json"
     payload: dict = {
         "arch": arch,
         "preprocess": preprocess,
+        "image_size": resolved_size,
         "accuracy": acc,
         "precision_macro": float(prec),
         "recall_macro": float(rec),
@@ -289,6 +349,9 @@ def _evaluate_loader_and_write(
         payload["dataset_test_split"] = dataset_test_split
     payload.update(_char_level_metrics(per_rows))
     payload.update(_dataset_split_summary(per_rows))
+    payload["per_class_accuracy"] = _per_class_accuracy(ys, ps, class_names)
+    if report_alnum_accuracy:
+        payload.update(_per_alnum_symbol_accuracy(per_rows))
 
     if not no_per_image_csv and per_rows:
         if per_image_csv_arg:
@@ -322,6 +385,25 @@ def _evaluate_loader_and_write(
     metrics_path = out_dir / metrics_name
     payload["metrics_json"] = str(metrics_path.resolve())
     metrics_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if report_alnum_accuracy and payload.get("per_class_accuracy"):
+        print("\n--- 各類別標籤準確率 ---", flush=True)
+        for label, st in sorted(payload["per_class_accuracy"].items()):
+            print(
+                f"  {label}: {st['correct']}/{st['total']} = {st['accuracy']:.4f}",
+                flush=True,
+            )
+        pl = payload.get("per_letter") or {}
+        pd = payload.get("per_digit") or {}
+        if pl:
+            print("\n--- 英文字母（標籤第 1 碼）---", flush=True)
+            for ch, st in pl.items():
+                print(f"  {ch}: {st['correct']}/{st['total']} = {st['accuracy']:.4f}", flush=True)
+        if pd:
+            print("\n--- 數字（標籤第 2 碼）---", flush=True)
+            for ch, st in pd.items():
+                print(f"  {ch}: {st['correct']}/{st['total']} = {st['accuracy']:.4f}", flush=True)
+
     return payload
 
 
@@ -334,7 +416,12 @@ def main() -> None:
         default="",
         help="若未指定 --weights，則使用 runs_classic/<arch>/best.pt（見 models.ARCH_CHOICES）",
     )
-    p.add_argument("--dataset", type=str, default="nmos", help="cifar10 | nmos | dataset | ImageFolder 根目錄")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="nmos",
+        help="cifar10 | nmos | dataset | dienumbers | ImageFolder 根目錄",
+    )
     p.add_argument("--data-root", type=str, default="data")
     p.add_argument("--dataset-root", type=str, default="dataset", help="dataset 根目錄（內含 nmos/ 與 dienumbers/）")
     p.add_argument("--nmos-dir", type=str, default="nmos", help="nmos 資料夾（評估時若權重內有 nmos_dir 則優先使用）")
@@ -365,6 +452,14 @@ def main() -> None:
         choices=("combined", "nmos", "dienumbers", "separate"),
         help="dataset 模式：測試集來源；separate 會各跑一次並輸出兩份 metrics/csv",
     )
+    p.add_argument(
+        "--image-size",
+        type=int,
+        nargs=2,
+        metavar=("H", "W"),
+        default=None,
+        help="Resize 高度與寬度；未指定則用權重內 image_size 或依架構預設",
+    )
     args = p.parse_args()
 
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -393,8 +488,15 @@ def main() -> None:
     if preprocess not in {"none", "p10"}:
         raise ValueError("preprocess 只支援 none 或 p10")
 
+    image_size: tuple[int, int] | None = None
+    if args.image_size is not None:
+        image_size = (int(args.image_size[0]), int(args.image_size[1]))
+    elif isinstance(ckpt.get("image_size"), (list, tuple)) and len(ckpt["image_size"]) == 2:
+        image_size = (int(ckpt["image_size"][0]), int(ckpt["image_size"][1]))
+
     class_names: list[str] = []
     eval_jobs: list[tuple[str, list[str], DataLoader, str | None]] = []
+    report_alnum = ds == "dienumbers"
 
     if ds == "cifar10":
         image_ids, loader = get_cifar10_test_ids_and_loader(
@@ -411,7 +513,7 @@ def main() -> None:
         tr = float(ckpt.get("nmos_test_ratio", args.nmos_test_ratio))
         sd = int(ckpt.get("split_seed", args.split_seed))
         image_ids, loader = get_nmos_test_paths_and_loader(
-            nmos_root, arch, args.batch_size, args.workers, vr, tr, preprocess, sd
+            nmos_root, arch, args.batch_size, args.workers, vr, tr, preprocess, sd, image_size
         )
         raw_names = ckpt.get("class_names")
         if isinstance(raw_names, list) and len(raw_names) == num_classes:
@@ -419,6 +521,31 @@ def main() -> None:
         else:
             class_names = [str(i) for i in range(num_classes)]
         eval_jobs = [("", image_ids, loader, None)]
+    elif ds == "dienumbers":
+        dataset_root = ckpt.get("dataset_root") or args.dataset_root
+        root = Path(dataset_root)
+        if not root.is_absolute():
+            root = _ROOT / root
+        die_train = ckpt.get("dienumbers_dir")
+        die_train_root = Path(die_train) if die_train else (root / "dienumbers")
+        if not die_train_root.is_absolute():
+            die_train_root = _ROOT / die_train_root
+        args.max_test_samples = 0
+        raw_names = ckpt.get("class_names")
+        iids, loader, eval_class_names = get_dienumbers_eval_paths_and_loader(
+            root,
+            arch,
+            args.batch_size,
+            args.workers,
+            preprocess,
+            image_size,
+            die_train_root,
+        )
+        if isinstance(raw_names, list) and len(raw_names) == num_classes:
+            class_names = [str(x) for x in raw_names]
+        else:
+            class_names = eval_class_names
+        eval_jobs = [("", iids, loader, "dienumbers")]
     elif ds == "dataset":
         dataset_root = ckpt.get("dataset_root") or args.dataset_root
         root = Path(dataset_root)
@@ -437,17 +564,43 @@ def main() -> None:
         if split_arg == "separate":
             for tag in ("nmos", "dienumbers"):
                 iids, ld = get_dataset_eval_paths_and_loader(
-                    root, arch, args.batch_size, args.workers, vr, preprocess, sd, test_split=tag
+                    root,
+                    arch,
+                    args.batch_size,
+                    args.workers,
+                    vr,
+                    preprocess,
+                    sd,
+                    test_split=tag,
+                    image_size=image_size,
                 )
                 eval_jobs.append((f"_{tag}", iids, ld, tag))
         elif split_arg in ("nmos", "dienumbers"):
             iids, ld = get_dataset_eval_paths_and_loader(
-                root, arch, args.batch_size, args.workers, vr, preprocess, sd, test_split=split_arg
+                root,
+                arch,
+                args.batch_size,
+                args.workers,
+                vr,
+                preprocess,
+                sd,
+                test_split=split_arg,
+                image_size=image_size,
             )
             eval_jobs.append((f"_{split_arg}", iids, ld, split_arg))
+            if split_arg == "dienumbers":
+                report_alnum = True
         else:
             iids, ld = get_dataset_eval_paths_and_loader(
-                root, arch, args.batch_size, args.workers, vr, preprocess, sd, test_split="combined"
+                root,
+                arch,
+                args.batch_size,
+                args.workers,
+                vr,
+                preprocess,
+                sd,
+                test_split="combined",
+                image_size=image_size,
             )
             eval_jobs.append(("", iids, ld, "combined"))
     else:
@@ -475,6 +628,8 @@ def main() -> None:
             no_per_image_csv=args.no_per_image_csv,
             max_test_samples=args.max_test_samples,
             dataset_test_split=dts,
+            image_size=image_size,
+            report_alnum_accuracy=report_alnum or dts == "dienumbers",
         )
         outputs.append(pl)
 
